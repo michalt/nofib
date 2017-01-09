@@ -11,6 +11,9 @@
 TOP = .
 include $(TOP)/mk/boilerplate.mk
 
+# Don't try to build the Shake files.
+SRCS =
+
 # Set up which parts of the nofib suite that is to be
 # run. See $(TOP)/../mk/config.mk, which tells you how
 # to set NoFibSubDirs
@@ -35,3 +38,6 @@ include $(TOP)/mk/target.mk
 dist :: dist-post
 dist :: dist-package
 
+# DO NOT DELETE: Beginning of Haskell dependencies
+spectral/treejoin/Main.-dep-makefile=_build/8.0.1/-O1/spectral/treejoin/Main.depso : spectral/treejoin/Main.hs
+# DO NOT DELETE: End of Haskell dependencies
