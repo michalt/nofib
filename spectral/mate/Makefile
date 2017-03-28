@@ -5,7 +5,7 @@ include $(TOP)/mk/boilerplate.mk
 # compiles them in the right order.
 # TODO(michalt): This should go away once we move to the Shake-based system.
 HS_SRCS = Board.hs Move.hs Problem.hs Solution.hs Main.hs
-PROG_ARGS = holzhausen.prob
+PROG_ARGS = runtime_files/holzhausen.prob
 
 # 	Other problems
 # ellerman.prob heathcote3.prob kidson.prob marin.prob \
