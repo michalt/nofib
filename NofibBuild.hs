@@ -11,6 +11,7 @@ import Data.Maybe
 import Data.List
 import Data.Time.Clock
 import qualified System.Directory as IO
+import qualified System.IO as IO
 import System.Exit
 import System.IO
 import System.Info
@@ -113,7 +114,7 @@ buildRules options@(Options {..}) = do
         need allMains
         putNormal "Built all executables."
 
-        forM_ optTests (\srcDir -> do
+        forM_ optTests $ \srcDir -> do
             let outDir = outputPath options </> srcDir
                 configFile = outDir </> configFileName
             need [configFile]
@@ -126,15 +127,20 @@ buildRules options@(Options {..}) = do
             need $ map (\f -> outDir </> "_stdout_expected" </> f) stdouts
             runtimeFiles <- getRuntimeFiles srcDir
             need $ map (\f -> outDir </> "runtime_files" </> f) runtimeFiles
-            )
+
         putNormal "Copied all runtime files."
 
         results <- liftIO $ concatMapM (runTest options) optTests
+        ghcStats <- flip concatMapM optTests $ \srcDir -> do
+            statsFiles <- getDirectoryFiles (outputPath options </> srcDir) ["*.stats_compile", "*.stats_link"]
+            let read f = readFileLines (outputPath options </> srcDir </> f)
+            concatMapM read statsFiles
         let resultLines =
                 concatMap formatResult results ++
                 [formatSummary results]
-        writeFileLines out resultLines
+        writeFileLines out (ghcStats ++ resultLines)
         liftIO $ mapM_ putStrLn resultLines
+        putNormal $ "Results available in: " ++ out
 
     "_build//Main.cfg" %> \out -> do
         let srcDir = getSrcDir options out
@@ -146,7 +152,7 @@ buildRules options@(Options {..}) = do
             collapse [] = []
         writeFileLines out $ convertConfig (lines $ collapse mkfile)
 
-    ("_build//Main" <.> exe) %> \out -> do
+    ["_build//Main" <.> exe, "_build//Main.stats_link"] &%> \[out, statsFile] -> do
         let outDir = takeDirectory out
             srcDir = getSrcDir options out
             configFile = outDir </> configFileName
@@ -159,18 +165,22 @@ buildRules options@(Options {..}) = do
 
         let name = takeFileName srcDir
         putNofibMsg out "time to link"
-        unit $ cmd optGhc $
-            ["-Rghc-timing", "-rtsopts", "-o", out]
-                ++ objFiles
-                ++ words optGhcFlags
-                ++ words (config "HC_OPTS")
-                ++ words (config "SRC_HC_OPTS")
+        stats <- withTempFile $ \tmpFile -> do
+            unit $ cmd optGhc $
+                [ "+RTS", "-t" ++ tmpFile, "-RTS", "-rtsopts", "-o", out]
+                    ++ objFiles
+                    ++ words optGhcFlags
+                    ++ words (config "HC_OPTS")
+                    ++ words (config "SRC_HC_OPTS")
+            liftIO $ IO.readFile tmpFile
 
+        writeFileLines statsFile $ "!!! TIME TO LINK !!!" : lines stats
         putNofibMsg out "size of"
         unit $ cmd "strip" [out]
+        -- FIXME: Capture the output of `size` and put into the `stats` file.
         unit $ cmd "size" [out]
 
-    ["_build//*.o", "_build//*.hi"] &%> \[oFile, hiFile] -> do
+    ["_build//*.o", "_build//*.hi", "_build//*.stats_compile"] &%> \[oFile, hiFile, statsFile] -> do
         let srcDir = getSrcDir options oFile
             outDir = takeDirectory oFile
         let depsFile = dropExtension oFile <.> "deps"
@@ -189,7 +199,7 @@ buildRules options@(Options {..}) = do
         -- FIXME: Clean up the compiler invocations to have just *one* place
         -- that defines which flags to pass and how (e.g., the `config` stuff)
         unit $ cmd optGhc $
-            [ "-Rghc-timing"
+            [ "+RTS", "-t" ++ statsFile, "-RTS"
             , "-c"
             , file_name
             , "-w"
@@ -203,6 +213,7 @@ buildRules options@(Options {..}) = do
             words (config "SRC_HC_OPTS") ++
             words optGhcFlags
         putNofibMsg oFile "size of"
+        -- FIXME: Capture the output of `size` and put into the `stats` file.
         unit $ cmd "size" [oFile]
 
     "_build//*.deps" %> \out -> do
