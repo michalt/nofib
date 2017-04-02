@@ -111,7 +111,24 @@ buildRules options@(Options {..}) = do
     -- what's the status of running the build.
     "_build//nofib_results.txt" %> \out -> do
         need allMains
-        putNormal "Built all executables. Running the benchmarks."
+        putNormal "Built all executables."
+
+        forM_ optTests (\srcDir -> do
+            let outDir = outputPath options </> srcDir
+                configFile = outDir </> configFileName
+            need [configFile]
+            config <- readTestVars' configFile
+            srcDirFiles <- getDirectoryFiles srcDir ["*"]
+            let (mstdin, stdouts, mstderr) =
+                    getSrcStdFilenames config optSpeed srcDirFiles
+            need $ maybe [] (\f -> [outDir </> "_stdin_expected" </> f]) mstdin
+            need $ maybe [] (\f -> [outDir </> "_stderr_expected" </> f]) mstderr
+            need $ map (\f -> outDir </> "_stdout_expected" </> f) stdouts
+            runtimeFiles <- getRuntimeFiles srcDir
+            need $ map (\f -> outDir </> "runtime_files" </> f) runtimeFiles
+            )
+        putNormal "Copied all runtime files."
+
         results <- liftIO $ concatMapM (runTest options) optTests
         let resultLines =
                 concatMap formatResult results ++
@@ -136,22 +153,8 @@ buildRules options@(Options {..}) = do
         srcDirFiles <- getDirectoryFiles srcDir ["*"]
         need [configFile]
         config <- readTestVars' configFile
-
-        -- TODO: Consider moving this to some other rule (it's not actually
-        -- needed to create `Main`)
-        case Runtime `elem` optMeasurements of
-            False -> return ()
-            True -> do
-                let (mstdin, stdouts, mstderr) =
-                        getSrcStdFilenames config optSpeed srcDirFiles
-                need $ maybe [] (\f -> [outDir </> "_stdin_expected" </> f]) mstdin
-                need $ maybe [] (\f -> [outDir </> "_stderr_expected" </> f]) mstderr
-                need $ map (\f -> outDir </> "_stdout_expected" </> f) stdouts
-                runtimeFiles <- getRuntimeFiles srcDir
-                need $ map (\f -> outDir </> "runtime_files" </> f) runtimeFiles
-
         let srcFiles = getAllSrcFiles config srcDirFiles
-        let objFiles = map (\f -> outDir </> replaceExtension f "o") srcFiles
+            objFiles = map (\f -> outDir </> replaceExtension f "o") srcFiles
         need objFiles
 
         let name = takeFileName srcDir
