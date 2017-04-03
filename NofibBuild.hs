@@ -95,6 +95,7 @@ configFileName = "Main.cfg"
 concatMapM :: (Monad m) => (a -> m [b]) -> [a] -> m [b]
 concatMapM f xs =  liftM concat (mapM f xs)
 
+
 buildRules :: Options -> Rules ()
 buildRules options@(Options {..}) = do
     let allMains =
@@ -132,9 +133,14 @@ buildRules options@(Options {..}) = do
 
         results <- liftIO $ concatMapM (runTest options) optTests
         ghcStats <- flip concatMapM optTests $ \srcDir -> do
-            statsFiles <- getDirectoryFiles (outputPath options </> srcDir) ["*.stats_compile", "*.stats_link"]
-            let read f = readFileLines (outputPath options </> srcDir </> f)
-            concatMapM read statsFiles
+            statsFiles <- getDirectoryFiles
+                              (outputPath options </> srcDir) ["*.o.stats_*", "*.stats_*"]
+            let mkpath f = outputPath options </> srcDir </> f
+                getStats f = do
+                     let p = mkpath f
+                     stats <- readFileLines p
+                     return (nofibMsgHeader p : stats)
+            concatMapM getStats statsFiles
         let resultLines =
                 concatMap formatResult results ++
                 [formatSummary results]
@@ -152,7 +158,8 @@ buildRules options@(Options {..}) = do
             collapse [] = []
         writeFileLines out $ convertConfig (lines $ collapse mkfile)
 
-    ["_build//Main" <.> exe, "_build//Main.stats_link"] &%> \[out, statsFile] -> do
+    ["_build//Main" <.> exe, "_build//Main.stats_link", "_build//Main.stats_size"] &%>
+            \[out, statsLink, statsSize] -> do
         let outDir = takeDirectory out
             srcDir = getSrcDir options out
             configFile = outDir </> configFileName
@@ -163,24 +170,19 @@ buildRules options@(Options {..}) = do
             objFiles = map (\f -> outDir </> replaceExtension f "o") srcFiles
         need objFiles
 
-        let name = takeFileName srcDir
-        putNofibMsg out "time to link"
-        stats <- withTempFile $ \tmpFile -> do
-            unit $ cmd optGhc $
-                [ "+RTS", "-t" ++ tmpFile, "-RTS", "-rtsopts", "-o", out]
-                    ++ objFiles
-                    ++ words optGhcFlags
-                    ++ words (config "HC_OPTS")
-                    ++ words (config "SRC_HC_OPTS")
-            liftIO $ IO.readFile tmpFile
+        unit $ cmd optGhc $
+            [ "+RTS", "-t" ++ statsLink, "-RTS", "-rtsopts", "-o", out]
+                ++ objFiles
+                ++ words optGhcFlags
+                ++ words (config "HC_OPTS")
+                ++ words (config "SRC_HC_OPTS")
 
-        writeFileLines statsFile $ "!!! TIME TO LINK !!!" : lines stats
-        putNofibMsg out "size of"
         unit $ cmd "strip" [out]
-        -- FIXME: Capture the output of `size` and put into the `stats` file.
-        unit $ cmd "size" [out]
+        Stdout size <- cmd "size" [out]
+        writeFile' statsSize size
 
-    ["_build//*.o", "_build//*.hi", "_build//*.stats_compile"] &%> \[oFile, hiFile, statsFile] -> do
+    ["_build//*.o", "_build//*.hi", "_build//*.o.stats_compile", "_build//*.o.stats_size"] &%>
+            \[oFile, hiFile, statsCompile, statsSize] -> do
         let srcDir = getSrcDir options oFile
             outDir = takeDirectory oFile
         let depsFile = dropExtension oFile <.> "deps"
@@ -195,11 +197,10 @@ buildRules options@(Options {..}) = do
         file_name <- getSrcFile options oFile
         config <- readTestVars' $ outDir </> configFileName
 
-        putNofibMsg oFile "time to compile"
         -- FIXME: Clean up the compiler invocations to have just *one* place
         -- that defines which flags to pass and how (e.g., the `config` stuff)
         unit $ cmd optGhc $
-            [ "+RTS", "-t" ++ statsFile, "-RTS"
+            [ "+RTS", "-t" ++ statsCompile, "-RTS"
             , "-c"
             , file_name
             , "-w"
@@ -212,9 +213,9 @@ buildRules options@(Options {..}) = do
             words (config "HC_OPTS") ++
             words (config "SRC_HC_OPTS") ++
             words optGhcFlags
-        putNofibMsg oFile "size of"
-        -- FIXME: Capture the output of `size` and put into the `stats` file.
-        unit $ cmd "size" [oFile]
+
+        Stdout size <- cmd "size" [oFile]
+        writeFile' statsSize size
 
     "_build//*.deps" %> \out -> do
         let srcDir = getSrcDir options out
@@ -249,18 +250,6 @@ buildRules options@(Options {..}) = do
         -- directory should already contain `runtime_files` directory, so we
         -- just need to copy the files.
         copyFile' (dropOutput options out) out
-
--- FIXME: require that the FilePath is actually the test directory. Then we
--- could share more of this logic with the stuff running the benchmarks
-putNofibMsg :: FilePath -> String -> Action ()
-putNofibMsg filePath todo =
-    putNormal $
-        "==nofib== " ++ testName ++ ": " ++
-        todo ++ " " ++ fileName ++ " follows..."
-  where
-    path = splitDirectories filePath
-    testName = head $ drop (length path - 2) path
-    fileName = dropExtension . head $ drop (length path - 1) path
 
 dropLastPathElem :: FilePath -> FilePath
 dropLastPathElem path =
@@ -307,6 +296,25 @@ getRuntimeFiles srcDir = do
         else return []
 
 
+-- | Returns the nofib message expected by `nofib-analyse`.
+--
+-- We assume that the provided @filePath@ is of the form
+-- @<anything>/<test name>/<module name>.<ext>@
+nofibMsgHeader :: FilePath -> String
+nofibMsgHeader filePath =
+    "==nofib== " ++ testName ++ ": " ++ todo ++ " " ++ modName ++ " follows..."
+  where
+    todo
+        | ".stats_compile"  `isSuffixOf` filePath = "time to compile"
+        | ".stats_link"     `isSuffixOf` filePath = "time to link"
+        | ".stats_size"     `isSuffixOf` filePath = "size of"
+        | otherwise                               = error $ "ERROR: unexpected file: " ++ filePath
+    path = splitDirectories $ dropExtension filePath  -- drops only the .stats_* extension
+    testAndMod = drop (length path - 2) path
+    testName = head testAndMod
+    modName = head $ drop 1 testAndMod
+
+
 data BenchStatus
     = BenchSuccess
     | BenchBadExitCode
@@ -343,12 +351,9 @@ formatSummary results =
 --   Return True if the test passes.
 runTest :: Options -> FilePath -> IO [BenchResult]
 runTest options@(Options {..}) test = do
-    let testDir = outputPath options </> test
-    -- putStrLn $
-    let header =
-            "==nofib== " ++
-            takeDirectory1 test ++
-            ": time to run " ++ last (splitDirectories test) ++ " follows..."
+    let testName = last (splitDirectories test)
+        header = "==nofib== " ++ testName ++ ": time to run " ++ testName ++ " follows..."
+        testDir = outputPath options </> test
     config <- readTestVars $ testDir </> "Main.cfg"
     let args =
             words (config "PROG_ARGS") ++
