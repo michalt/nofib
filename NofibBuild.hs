@@ -1,4 +1,5 @@
-{-# LANGUAGE RecordWildCards, DeriveDataTypeable #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Main (main) where
 
@@ -70,7 +71,8 @@ main = do
         { shakeThreads = optThreads options
         , shakeFiles = buildDirectory </> optTag options ++ "/"
         , shakeReport = [buildDirectory </> optTag options </> "shake_report.html"]
-        , shakeVerbosity = Development.Shake.Chatty
+        -- FIXME: Introduce flag for verbosity? Or maybe pass some flags to Shake?
+        , shakeVerbosity = Development.Shake.Quiet
         } $
         buildRules options
 
@@ -131,7 +133,7 @@ buildRules options@(Options {..}) = do
 
         putNormal "Copied all runtime files."
 
-        results <- liftIO $ concatMapM (runTest options) optTests
+        results <- concatMapM (runTest options) optTests
         ghcStats <- flip concatMapM optTests $ \srcDir -> do
             statsFiles <- getDirectoryFiles
                               (outputPath options </> srcDir) ["*.o.stats_*", "*.stats_*"]
@@ -139,16 +141,19 @@ buildRules options@(Options {..}) = do
                 getStats f = do
                      let p = mkpath f
                      stats <- readFileLines p
+                     let !_ = length stats -- Lazy I/O :(
                      return (nofibMsgHeader p : stats)
             concatMapM getStats statsFiles
-        let resultLines =
+        let finalSummary = formatSummary results
+            resultLines =
                 concatMap formatResult results ++
-                [formatSummary results]
+                ["", finalSummary]
         writeFileLines out (ghcStats ++ resultLines)
-        liftIO $ mapM_ putStrLn resultLines
-        putNormal $ "Results available in: " ++ out
+        putQuiet $ finalSummary
+        putQuiet $ "Results available in: " ++ out
 
     "_build//Main.cfg" %> \out -> do
+
         let srcDir = getSrcDir options out
         mkfile <- readFile' $ srcDir </> "Makefile"
         -- Remove escaped newlines before calling `lines` to support, e.g.,
@@ -180,6 +185,7 @@ buildRules options@(Options {..}) = do
         unit $ cmd "strip" [out]
         Stdout size <- cmd "size" [out]
         writeFile' statsSize size
+        putQuiet $ "  HC [L] " ++ out
 
     ["_build//*.o", "_build//*.hi", "_build//*.o.stats_compile", "_build//*.o.stats_size"] &%>
             \[oFile, hiFile, statsCompile, statsSize] -> do
@@ -216,6 +222,7 @@ buildRules options@(Options {..}) = do
 
         Stdout size <- cmd "size" [oFile]
         writeFile' statsSize size
+        putQuiet $ "  HC     " ++ oFile
 
     "_build//*.deps" %> \out -> do
         let srcDir = getSrcDir options out
@@ -324,13 +331,13 @@ data BenchStatus
 
 data BenchResult = BenchResult
     { brHeader :: String
-    , brStats :: String
+    , brStats :: [String]
     , brStatus :: BenchStatus
     }
 
 formatResult :: BenchResult -> [String]
 formatResult results =
-    brHeader results : brStats results : [formatStatus $ brStatus results]
+    brHeader results : brStats results ++ [formatStatus $ brStatus results]
   where
     formatStatus BenchSuccess = "All checks successfull."
     formatStatus BenchBadStderr = "FAILED: stderr mismatch!"
@@ -349,34 +356,35 @@ formatSummary results =
 
 -- | Run a test, checking stdout/stderr are as expected, and reporting time.
 --   Return True if the test passes.
-runTest :: Options -> FilePath -> IO [BenchResult]
+runTest :: Options -> FilePath -> Action [BenchResult]
 runTest options@(Options {..}) test = do
     let testName = last (splitDirectories test)
         header = "==nofib== " ++ testName ++ ": time to run " ++ testName ++ " follows..."
         testDir = outputPath options </> test
-    config <- readTestVars $ testDir </> "Main.cfg"
+    config <- liftIO $ readTestVars $ testDir </> "Main.cfg"
     let args =
             words (config "PROG_ARGS") ++
             words (config $ map toUpper (show optSpeed) ++ "_OPTS")
-    (mstdinFile, stdoutFiles, stderrFiles) <- getStdFilenames testDir
-    statsFile <- IO.canonicalizePath $ testDir </> "stat.txt"
+    (mstdinFile, stdoutFiles, stderrFiles) <- liftIO $ getStdFilenames testDir
+    statsFile <- liftIO $ IO.canonicalizePath $ testDir </> "stat.txt"
     replicateM optNumRuns $ do
         let main = "./Main" <.> exe
             mainArgs = args ++ "+RTS" : words optRtsFlags ++ ["-t" ++ statsFile]
-        exitCode <- runProcessForTest testDir main mainArgs mstdinFile
+        exitCode <- liftIO $ runProcessForTest testDir main mainArgs mstdinFile
 
-        actStdout <- Bs.readFile (testDir </> "_stdout_actual")
-        actStderr <- Bs.readFile (testDir </> "_stderr_actual")
-        expStdouts <- readExpectedStd stdoutFiles
-        expStderrs <- readExpectedStd stderrFiles
+        actStdout <- liftIO $ Bs.readFile (testDir </> "_stdout_actual")
+        actStderr <- liftIO $ Bs.readFile (testDir </> "_stderr_actual")
+        expStdouts <- liftIO $ readExpectedStd stdoutFiles
+        expStderrs <- liftIO $ readExpectedStd stderrFiles
 
-        stats <- readFile statsFile
+        stats <- lines <$> liftIO (readFile statsFile)
         let status | optSkipChecks = BenchSuccess
                    | not (actStderr `elem` expStderrs) = BenchBadStderr
                    | not (actStdout `elem` expStdouts) = BenchBadStdout
                    | exitCode /= ExitSuccess = BenchBadExitCode
                    | otherwise = BenchSuccess
 
+        putQuiet $ (if status == BenchSuccess then "  Bench  " else "  FAIL   ") ++ testDir
         return $ BenchResult header stats status
 
 getStdFilenames :: FilePath -> IO (Maybe FilePath, [FilePath], [FilePath])
